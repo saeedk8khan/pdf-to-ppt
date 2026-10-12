@@ -186,11 +186,27 @@ if uploaded:
                         # and scales content relative to each page's own dimensions.
                         slide = prs.slides.add_slide(blank)
                         spans, source, page_dict = extract_spans(page, use_ocr, ocr_language)
-                        if mode == "Exact visual preservation (image slides)" or mode.startswith("Hybrid:"):
+                        # Many NotebookLM PDFs store each slide as a single full-page image.
+                        # If no usable text was extracted, render the page as a fallback so the
+                        # resulting slide is never silently blank. Such fallback slides are visual
+                        # images, not editable text.
+                        has_text = any(s.get("text", "").strip() for s in spans)
+                        full_page_image = any(
+                            b.get("type") == 1 and b.get("bbox") and
+                            ((b["bbox"][2] - b["bbox"][0]) * (b["bbox"][3] - b["bbox"][1]) /
+                             max(1, page.rect.width * page.rect.height)) >= 0.70
+                            for b in page_dict.get("blocks", [])
+                        )
+                        visual_fallback = (mode == "Editable reconstruction (recommended)" and
+                                           (not has_text or full_page_image and source != "embedded text"))
+                        if (mode == "Exact visual preservation (image slides)" or
+                            mode.startswith("Hybrid:") or visual_fallback):
                             pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
                             slide.shapes.add_picture(io.BytesIO(pix.tobytes("png")), 0, 0, Inches(slide_w), Inches(slide_h))
+                            if visual_fallback:
+                                source = source + " — full-page image fallback (visual content preserved; not editable)"
                         editable_count = 0
-                        if mode != "Exact visual preservation (image slides)":
+                        if mode != "Exact visual preservation (image slides)" and not visual_fallback:
                             # Add actual embedded illustrations before text so text stays selectable.
                             # Large page-sized rasters are skipped by add_embedded_images.
                             if not mode.startswith("Hybrid:"):
