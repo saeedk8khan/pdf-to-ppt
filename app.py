@@ -1,258 +1,276 @@
-"""NotebookLM PDF to PowerPoint converter with editable-text reconstruction.
+"""NotebookLM PDF -> editable PowerPoint.
 
-Text in text-based PDFs becomes native PowerPoint text boxes. Embedded raster images
-are retained as images. Scanned/image-only PDFs can use OCR if Tesseract is installed.
-No PDF-to-PPTX converter can guarantee both pixel-perfect fidelity and full editability.
+NotebookLM PDFs are flat pictures (no text layer). This app:
+  1. renders each page to an image,
+  2. reads the text (embedded text first, OCR otherwise),
+  3. erases that text from the image (so no double text),
+  4. places native, editable PowerPoint text boxes on top.
+Charts/icons/illustrations stay part of the background picture.
 """
 import io
-import tempfile
+import os
+import shutil
 from pathlib import Path
 
 import fitz  # PyMuPDF
+import numpy as np
 import streamlit as st
+from PIL import Image
 from pptx import Presentation
-from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.dml.color import RGBColor
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 
+try:
+    import cv2  # optional, gives cleaner background repair on gradients/photos
+except ImportError:
+    cv2 = None
+
 APP_TITLE = "NotebookLM PDF → Editable PowerPoint"
-DEFAULT_DPI = 200
-
-st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="centered")
-st.title(APP_TITLE)
-st.write(
-    "Convert NotebookLM-exported PDFs into PowerPoint. Choose editable reconstruction "
-    "to turn extractable text into editable text boxes instead of one full-slide image."
-)
-st.warning(
-    "Editable reconstruction preserves text and approximate placement, not pixel-perfect layout. "
-    "Photos and illustrations remain images; complex vector diagrams, decorative backgrounds, "
-    "and some tables may need manual rebuilding."
-)
-
-uploaded = st.file_uploader("Upload your NotebookLM PDF", type=["pdf"])
-mode = st.radio(
-    "Conversion mode",
-    ["Editable reconstruction (recommended)", "Hybrid: editable text + full-slide reference image", "Exact visual preservation (image slides)"],
-    index=0,
-    help="Hybrid keeps a reference image behind the editable text; the image can obscure text while editing. Use it for visual comparison, not as the cleanest editing experience."
-)
-use_ocr = st.checkbox("Use OCR when a page contains no extractable text (requires Tesseract installed)", value=True)
-ocr_language = st.text_input("OCR language code", value="eng", help="Examples: eng, eng+msa. Language packs must be installed in Tesseract.")
-dpi = st.slider("Reference-image resolution (DPI)", min_value=100, max_value=300, value=DEFAULT_DPI, step=25, disabled=(mode == "Editable reconstruction (recommended)"))
-include_report = st.checkbox("Include conversion report (.txt)", value=True)
+OCR_FACTOR = 0.8  # OCR line height -> approximate font size
 
 
-def page_size_inches(page):
-    # Preserve page aspect ratio; keep both dimensions below PowerPoint's practical limit.
-    max_dim = 56.0
-    w = 13.333
-    h = w * page.rect.height / page.rect.width
-    scale = min(1.0, max_dim / max(w, h))
-    return w * scale, h * scale
+# ----------------------------------------------------------------- helpers
+def find_tessdata():
+    cands = [os.environ.get("TESSDATA_PREFIX")]
+    cands += [
+        r"C:\Program Files\Tesseract-OCR\tessdata",
+        r"C:\Program Files (x86)\Tesseract-OCR\tessdata",
+        "/usr/share/tesseract-ocr/5/tessdata",
+        "/usr/share/tesseract-ocr/4.00/tessdata",
+        "/usr/share/tessdata",
+        "/opt/homebrew/share/tessdata",
+        "/usr/local/share/tessdata",
+    ]
+    for c in cands:
+        if c and Path(c).is_dir():
+            return str(c)
+    return None
 
 
-def pt_to_emu(value_pt, scale):
-    return Inches(value_pt / 72.0 * scale)
+def collect_lines(textdict):
+    lines = []
+    for b in textdict.get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        for ln in b.get("lines", []):
+            spans = [s for s in ln.get("spans", []) if s.get("text", "").strip()]
+            if not spans:
+                continue
+            text = "".join(s["text"] for s in ln["spans"]).strip()
+            main = max(spans, key=lambda s: s.get("size", 0))
+            lines.append({
+                "text": text,
+                "bbox": ln["bbox"],
+                "size": main.get("size", 12),
+                "font": main.get("font", ""),
+                "flags": int(main.get("flags", 0)),
+                "color": int(main.get("color", 0)),
+            })
+    return lines
 
 
-def color_from_int(value):
-    # PyMuPDF span colors are 0xRRGGBB.
-    return RGBColor((value >> 16) & 255, (value >> 8) & 255, value & 255)
+def extract_lines(page, use_ocr, lang, ocr_dpi):
+    """Return (lines, source, from_ocr)."""
+    lines = collect_lines(page.get_text("dict"))
+    if lines:
+        return lines, "embedded text", False
+    if not use_ocr:
+        return [], "no extractable text (OCR off)", False
+    try:
+        tp = page.get_textpage_ocr(language=lang or "eng", dpi=ocr_dpi, full=True,
+                                   tessdata=find_tessdata())
+        lines = collect_lines(page.get_text("dict", textpage=tp))
+        return lines, ("OCR" if lines else "OCR found no text"), True
+    except Exception as exc:
+        return [], f"OCR failed: {exc}", False
 
 
-def add_text_span(slide, span, page_rect, slide_w_in, slide_h_in):
-    text = span.get("text", "")
-    if not text or not text.strip():
-        return
-    x0, y0, x1, y1 = span.get("bbox", (0, 0, 10, 10))
-    sx = slide_w_in / page_rect.width
-    sy = slide_h_in / page_rect.height
-    left = max(0, x0 * sx)
-    top = max(0, y0 * sy)
-    width = max(0.03, min(slide_w_in - left, (x1 - x0) * sx + 0.015))
-    height = max(0.08, min(slide_h_in - top, (y1 - y0) * sy + 0.025))
-    box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+def px_box(bbox, k, origin, shape, pad=0):
+    h, w = shape[:2]
+    x0, y0, x1, y1 = bbox
+    return (max(0, int((x0 - origin[0]) * k) - pad),
+            max(0, int((y0 - origin[1]) * k) - pad),
+            min(w, int((x1 - origin[0]) * k) + pad + 1),
+            min(h, int((y1 - origin[1]) * k) + pad + 1))
+
+
+def ring_pixels(arr, box, pad=4):
+    x0, y0, x1, y1 = box
+    h, w = arr.shape[:2]
+    e = arr[max(0, y0 - pad):min(h, y1 + pad), max(0, x0 - pad):min(w, x1 + pad)]
+    if e.size == 0:
+        return np.zeros((1, 3), dtype=int)
+    t = 3
+    ring = np.concatenate([e[:t].reshape(-1, 3), e[-t:].reshape(-1, 3),
+                           e[:, :t].reshape(-1, 3), e[:, -t:].reshape(-1, 3)])
+    return ring.astype(int)
+
+
+def estimate_fg(arr, box, fallback):
+    """Text colour = pixels furthest from the surrounding background colour."""
+    x0, y0, x1, y1 = box
+    crop = arr[y0:y1, x0:x1].reshape(-1, 3).astype(int)
+    if crop.size == 0:
+        return fallback
+    bg = np.median(ring_pixels(arr, box), axis=0)
+    dist = np.abs(crop - bg).sum(axis=1)
+    if dist.max() < 60:  # no visible contrast; keep the PDF's own colour
+        return fallback
+    n = max(1, len(dist) // 10)
+    idx = np.argsort(dist)[-n:]
+    return tuple(int(v) for v in np.median(crop[idx], axis=0))
+
+
+def clean_background(arr, boxes):
+    """Remove text from the page image."""
+    if not boxes:
+        return arr
+    out = arr.copy()
+    mask = np.zeros(arr.shape[:2], np.uint8)
+    for b in boxes:
+        x0, y0, x1, y1 = b
+        ring = ring_pixels(arr, b)
+        if ring.std(axis=0).max() < 12 or cv2 is None:
+            out[y0:y1, x0:x1] = np.median(ring, axis=0).astype(np.uint8)  # flat background
+        else:
+            mask[y0:y1, x0:x1] = 255  # gradient/photo: inpaint
+    if mask.any() and cv2 is not None:
+        out = cv2.inpaint(out, mask, 3, cv2.INPAINT_TELEA)
+    return out
+
+
+def add_line(slide, ln, rect, scale, rgb, from_ocr):
+    x0, y0, x1, y1 = ln["bbox"]
+    left = (x0 - rect.x0) * scale
+    top = (y0 - rect.y0) * scale
+    width = (x1 - x0) * scale * 1.10 + 0.05
+    height = (y1 - y0) * scale + 0.02
+    size_pdf = (y1 - y0) * OCR_FACTOR if from_ocr else ln["size"]
+    size_pt = max(6, min(120, size_pdf * scale * 72))
+
+    box = slide.shapes.add_textbox(Inches(max(0, left)), Inches(max(0, top)),
+                                   Inches(width), Inches(height))
     tf = box.text_frame
-    tf.clear()
     tf.word_wrap = False
-    tf.margin_left = 0
-    tf.margin_right = 0
-    tf.margin_top = 0
-    tf.margin_bottom = 0
-    tf.vertical_anchor = MSO_ANCHOR.TOP
+    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
     p = tf.paragraphs[0]
-    p.space_before = Pt(0)
-    p.space_after = Pt(0)
     p.alignment = PP_ALIGN.LEFT
     run = p.add_run()
-    run.text = text
-    font = run.font
-    # Use a safe common font if the PDF's embedded font isn't installed on the user's PC.
-    pdf_font = span.get("font", "")
-    font.name = "Arial" if not pdf_font else pdf_font.split(",")[0].replace("+", "")
-    font.size = Pt(max(4, min(96, float(span.get("size", 12)) * sy * 72)))
-    flags = int(span.get("flags", 0))
-    font.italic = bool(flags & 2)
-    font.bold = bool(flags & 16) or "bold" in pdf_font.lower()
-    try:
-        font.color.rgb = color_from_int(int(span.get("color", 0)))
-    except Exception:
-        font.color.rgb = RGBColor(0, 0, 0)
+    run.text = ln["text"]
+    f = run.font
+    font_name = ln["font"].split("+")[-1].split(",")[0].split("-")[0] if ln["font"] and not from_ocr else ""
+    f.name = font_name or "Arial"
+    f.size = Pt(size_pt)
+    f.bold = bool(ln["flags"] & 16) or "bold" in ln["font"].lower()
+    f.italic = bool(ln["flags"] & 2)
+    f.color.rgb = RGBColor(*rgb)
 
 
-def extract_spans(page, ocr_enabled, language):
-    data = page.get_text("dict")
-    spans = []
-    for block in data.get("blocks", []):
-        if block.get("type") == 0:
-            for line in block.get("lines", []):
-                spans.extend(line.get("spans", []))
-    source = "embedded text"
-    if not any(s.get("text", "").strip() for s in spans) and ocr_enabled:
-        try:
-            textpage = page.get_textpage_ocr(language=language or "eng", dpi=200, full=True)
-            ocr_data = page.get_text("dict", textpage=textpage)
-            spans = []
-            for block in ocr_data.get("blocks", []):
-                if block.get("type") == 0:
-                    for line in block.get("lines", []):
-                        spans.extend(line.get("spans", []))
-            source = "OCR" if any(s.get("text", "").strip() for s in spans) else "no text detected"
-        except Exception as exc:
-            source = f"OCR unavailable: {exc}"
-    elif not any(s.get("text", "").strip() for s in spans):
-        source = "no extractable text"
-    return spans, source, data
+# ---------------------------------------------------------------- converter
+def convert_pdf(pdf_bytes, editable, use_ocr, lang, dpi, progress=None):
+    report, problems = [], []
+    k = dpi / 72.0
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        n = len(pdf)
+        prs = Presentation()
+        first = pdf[0].rect
+        slide_w = 13.333
+        slide_h = slide_w * first.height / first.width
+        prs.slide_width, prs.slide_height = Inches(slide_w), Inches(slide_h)
+        blank = prs.slide_layouts[6]
+
+        for i, page in enumerate(pdf):
+            rect = page.rect
+            scale = slide_w / rect.width
+            pix = page.get_pixmap(matrix=fitz.Matrix(k, k), alpha=False)
+            arr = np.array(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+            slide = prs.slides.add_slide(blank)
+
+            lines, source, from_ocr = [], "image only", False
+            if editable:
+                lines, source, from_ocr = extract_lines(page, use_ocr, lang, max(dpi, 250))
+
+            colors = []
+            if lines:
+                boxes = [px_box(l["bbox"], k, (rect.x0, rect.y0), arr.shape, pad=3) for l in lines]
+                for l, b in zip(lines, boxes):
+                    c = l["color"]
+                    colors.append(estimate_fg(arr, b, ((c >> 16) & 255, (c >> 8) & 255, c & 255)))
+                arr = clean_background(arr, boxes)
+            elif editable:
+                problems.append(i + 1)
+
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, "PNG")
+            buf.seek(0)
+            slide.shapes.add_picture(buf, 0, 0, Inches(slide_w), Inches(slide_h))
+
+            for l, rgb in zip(lines, colors):
+                add_line(slide, l, rect, scale, rgb, from_ocr)
+
+            report.append(f"Page {i + 1}: text boxes={len(lines)}; source={source}")
+            if progress:
+                progress((i + 1) / n, f"Converted {i + 1}/{n} pages")
+
+        out = io.BytesIO()
+        prs.save(out)
+    return out.getvalue(), report, problems
 
 
-def add_embedded_images(slide, page, page_rect, slide_w_in, slide_h_in):
-    """Place embedded raster image blocks at approximate original positions."""
-    count = 0
-    data = page.get_text("dict")
-    for block in data.get("blocks", []):
-        if block.get("type") != 1 or not block.get("image"):
-            continue
-        bbox = block.get("bbox")
-        if not bbox:
-            continue
-        x0, y0, x1, y1 = bbox
-        # Do not reinsert a full-page raster: that would cover/defeat editable OCR text.
-        area_ratio = max(0, x1 - x0) * max(0, y1 - y0) / max(1, page_rect.width * page_rect.height)
-        if area_ratio >= 0.70:
-            continue
-        left = max(0, x0 / page_rect.width * slide_w_in)
-        top = max(0, y0 / page_rect.height * slide_h_in)
-        width = min(slide_w_in - left, max(0.01, (x1 - x0) / page_rect.width * slide_w_in))
-        height = min(slide_h_in - top, max(0.01, (y1 - y0) / page_rect.height * slide_h_in))
-        try:
-            slide.shapes.add_picture(io.BytesIO(block["image"]), Inches(left), Inches(top), Inches(width), Inches(height))
-            count += 1
-        except Exception:
-            pass
-    return count
+# ---------------------------------------------------------------------- UI
+st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="centered")
+st.title(APP_TITLE)
+st.write("Upload a NotebookLM PDF. Text becomes editable PowerPoint text; the rest of the "
+         "slide stays as a clean background picture.")
+
+tess_ok = shutil.which("tesseract") is not None
+if tess_ok:
+    st.success("Tesseract OCR found.")
+else:
+    st.error("Tesseract OCR was not found. NotebookLM PDFs contain no text layer, so without "
+             "OCR the slides will be pictures only. Install Tesseract (Windows: UB Mannheim "
+             "installer; Streamlit Cloud: put `tesseract-ocr` in packages.txt).")
+
+uploaded = st.file_uploader("Upload your NotebookLM PDF", type=["pdf"])
+mode = st.radio("Conversion mode",
+                ["Editable slides (recommended)", "Image-only slides (exact look)"], index=0)
+use_ocr = st.checkbox("Use OCR for pages with no text", value=True)
+lang = st.text_input("OCR language code", value="eng", help="e.g. eng, eng+msa")
+dpi = st.slider("Background image resolution (DPI)", 100, 300, 200, 25)
+include_report = st.checkbox("Include conversion report (.txt)", value=True)
 
 if uploaded:
     pdf_bytes = uploaded.getvalue()
     if not pdf_bytes.startswith(b"%PDF"):
         st.error("This file does not appear to be a valid PDF.")
         st.stop()
-    try:
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
-            page_count = len(pdf)
-            if not page_count:
-                st.error("The PDF has no pages.")
-                st.stop()
-            st.write(f"**File:** {uploaded.name}  \n**Pages detected:** {page_count:,}")
-            if st.button("Convert PDF to PowerPoint", type="primary", use_container_width=True):
-                prs = Presentation()
-                first = pdf[0]
-                slide_w, slide_h = page_size_inches(first)
-                prs.slide_width, prs.slide_height = Inches(slide_w), Inches(slide_h)
-                blank = prs.slide_layouts[6]
-                report = [
-                    f"Source PDF: {uploaded.name}", f"Page count: {page_count}", f"Mode: {mode}",
-                    "Text is reconstructed as editable PowerPoint text boxes where extraction/OCR succeeds.", ""
-                ]
-                progress = st.progress(0, text="Preparing slides…")
-                status = st.empty()
-                with tempfile.TemporaryDirectory(prefix="notebooklm_ppt_") as tmp:
-                    out_path = Path(tmp) / "notebooklm_converted.pptx"
-                    for i, page in enumerate(pdf):
-                        status.write(f"Processing page {i + 1:,} of {page_count:,}…")
-                        page_w, page_h = page.rect.width, page.rect.height
-                        sw, sh = page_size_inches(page)
-                        # If a PDF has mixed page sizes, this version keeps the deck size from page 1
-                        # and scales content relative to each page's own dimensions.
-                        slide = prs.slides.add_slide(blank)
-                        spans, source, page_dict = extract_spans(page, use_ocr, ocr_language)
-                        
-                        has_text = any(s.get("text", "").strip() for s in spans)
-                        
-                        # Check if the page contains a full-page image
-                        full_page_image = any(
-                            b.get("type") == 1 and b.get("bbox") and
-                            ((b["bbox"][2] - b["bbox"][0]) * (b["bbox"][3] - b["bbox"][1]) /
-                             max(1, page.rect.width * page.rect.height)) >= 0.70
-                            for b in page_dict.get("blocks", [])
-                        )
-                        
-                        # If editable mode is selected but there's no extractable text or it's a full-page image,
-                        # fallback to rendering the slide as an image so it is never blank.
-                        visual_fallback = (
-                            mode.startswith("Editable reconstruction") and 
-                            (not has_text or full_page_image) and 
-                            source != "embedded text"
-                        )
+    if st.button("Convert PDF to PowerPoint", type="primary", use_container_width=True):
+        try:
+            bar = st.progress(0, text="Starting…")
+            data, report, problems = convert_pdf(
+                pdf_bytes, mode.startswith("Editable"), use_ocr, lang, dpi,
+                progress=lambda v, t: bar.progress(v, text=t))
+            st.session_state["pptx"] = data
+            st.session_state["name"] = Path(uploaded.name).stem + "_editable.pptx"
+            st.session_state["report"] = "\n".join(report)
+            st.success(f"Conversion complete: {len(report)} slides.")
+            if problems:
+                st.warning(f"No text was recognised on pages {problems}. "
+                           "Check Tesseract installation and the language code.")
+        except Exception as exc:
+            st.error(f"Conversion failed: {exc}")
+            st.exception(exc)
 
-                        if (mode == "Exact visual preservation (image slides)" or
-                            mode.startswith("Hybrid:") or visual_fallback):
-                            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
-                            slide.shapes.add_picture(io.BytesIO(pix.tobytes("png")), 0, 0, Inches(slide_w), Inches(slide_h))
-                            if visual_fallback:
-                                source = source + " — full-page image fallback (visual content preserved)"
-
-                        editable_count = 0
-                        if mode != "Exact visual preservation (image slides)" and not visual_fallback:
-                            # Add actual embedded illustrations before text so text stays selectable.
-                            # Large page-sized rasters are skipped by add_embedded_images.
-                            if not mode.startswith("Hybrid:"):
-                                image_count = add_embedded_images(slide, page, page.rect, slide_w, slide_h)
-                            else:
-                                image_count = 0
-                            for span in spans:
-                                if span.get("text", "").strip():
-                                    add_text_span(slide, span, page.rect, slide_w, slide_h)
-                                    editable_count += 1
-                        else:
-                            image_count = 1
-
-                        report.append(f"Page {i+1}: text spans={editable_count}; image objects={image_count}; text source={source}")
-                        progress.progress((i + 1) / page_count, text=f"Converted {i+1:,}/{page_count:,} pages")
-
-                    status.write("Packaging PowerPoint…")
-                    prs.core_properties.title = Path(uploaded.name).stem + " — Editable PDF conversion"
-                    prs.core_properties.subject = "PDF to PowerPoint with editable text reconstruction"
-                    prs.save(out_path)
-                    pptx_bytes = out_path.read_bytes()
-                st.session_state["converted_pptx"] = pptx_bytes
-                st.session_state["converted_name"] = Path(uploaded.name).stem + ("_editable.pptx" if mode.startswith("Editable") else "_converted.pptx")
-                st.session_state["converted_report"] = "\n".join(report)
-                st.success(f"Conversion complete: {page_count:,} slides created.")
-                st.info("Open PowerPoint and select text to verify editability. If a page is image-only, install Tesseract and enable OCR; OCR quality depends on image resolution and language packs.")
-    except Exception as exc:
-        st.error(f"Conversion failed: {exc}")
-        st.exception(exc)
-
-if "converted_pptx" in st.session_state:
+if "pptx" in st.session_state:
     st.download_button(
-        "Download PowerPoint (.pptx)", data=st.session_state["converted_pptx"],
-        file_name=st.session_state["converted_name"],
+        "Download PowerPoint (.pptx)", data=st.session_state["pptx"],
+        file_name=st.session_state["name"],
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        type="primary", use_container_width=True
-    )
-    if include_report and "converted_report" in st.session_state:
-        st.download_button("Download conversion report (.txt)", data=st.session_state["converted_report"].encode("utf-8"), file_name="conversion_report.txt", mime="text/plain", use_container_width=True)
-
-st.divider()
-st.caption("Conversion runs on the computer/server where you launch the app. For OCR fallback, install Tesseract separately; see README for Windows steps. Large PDFs require adequate RAM and temporary disk space.")
+        type="primary", use_container_width=True)
+    if include_report:
+        st.download_button("Download conversion report (.txt)",
+                           data=st.session_state["report"].encode("utf-8"),
+                           file_name="conversion_report.txt", mime="text/plain",
+                           use_container_width=True)
