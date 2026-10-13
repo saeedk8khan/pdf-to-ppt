@@ -1,2 +1,4 @@
 fonts-liberation
 libgl1
+tesseract-ocr
+tesseract-ocr-eng
