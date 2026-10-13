@@ -15,10 +15,10 @@ from pathlib import Path
 import fitz  # PyMuPDF
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageFont
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Inches, Pt
 
 try:
@@ -27,7 +27,7 @@ except ImportError:
     cv2 = None
 
 APP_TITLE = "NotebookLM PDF → Editable PowerPoint"
-OCR_FACTOR = 0.8  # OCR line height -> approximate font size
+OCR_FACTOR = 1.05  # OCR line height -> approximate font size
 
 
 # ----------------------------------------------------------------- helpers
@@ -50,7 +50,7 @@ def find_tessdata():
 
 def collect_lines(textdict):
     lines = []
-    for b in textdict.get("blocks", []):
+    for bi, b in enumerate(textdict.get("blocks", [])):
         if b.get("type") != 0:
             continue
         for ln in b.get("lines", []):
@@ -61,6 +61,7 @@ def collect_lines(textdict):
             main = max(spans, key=lambda s: s.get("size", 0))
             lines.append({
                 "text": text,
+                "block": bi,
                 "bbox": ln["bbox"],
                 "size": main.get("size", 12),
                 "font": main.get("font", ""),
@@ -140,36 +141,138 @@ def clean_background(arr, boxes):
     return out
 
 
-def add_line(slide, ln, rect, scale, rgb, from_ocr):
+_FONT_FILES = {
+    False: ["C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf"],
+    True: ["C:/Windows/Fonts/arialbd.ttf",
+           "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+           "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+           "/Library/Fonts/Arial Bold.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"],
+}
+_font_cache = {}
+
+
+def _font(bold):
+    if bold not in _font_cache:
+        f = None
+        for p in _FONT_FILES[bold]:
+            if Path(p).is_file():
+                try:
+                    f = ImageFont.truetype(p, 100)
+                    break
+                except Exception:
+                    pass
+        _font_cache[bold] = f
+    return _font_cache[bold]
+
+
+def em_width(text, bold):
+    """Text width in units of font size (Arial metrics)."""
+    f = _font(bold)
+    return f.getlength(text) / 100.0 if f else len(text) * 0.55
+
+
+def layout_lines(lines, arr, boxes, scale, k, from_ocr):
+    """Decide font size, bold and alignment per line so blocks stay uniform and never overflow."""
+    n = len(lines)
+    sizes, bolds = [0.0] * n, [False] * n
+    px_per_pt = k / (scale * 72.0)  # image pixels per slide point
+    blocks = {}
+    for i, l in enumerate(lines):
+        blocks.setdefault(l["block"], []).append(i)
+
+    for idxs in blocks.values():
+        # starting size
+        if from_ocr:
+            hs = [(lines[i]["bbox"][3] - lines[i]["bbox"][1]) * OCR_FACTOR * scale * 72 for i in idxs]
+            size_h = float(np.median(hs))
+            reg_fits = [(lines[i]["bbox"][2] - lines[i]["bbox"][0]) * scale * 72
+                        / max(0.1, em_width(lines[i]["text"], False)) for i in idxs]
+            size_ref = min(size_h, float(np.median(reg_fits)))
+            dens = []
+            for i in idxs:
+                t = lines[i]["text"]
+                x0, y0, x1, y1 = boxes[i]
+                crop = arr[y0:y1, x0:x1].reshape(-1, 3).astype(int)
+                if len(t) < 3 or crop.size == 0:
+                    continue
+                bg = np.median(ring_pixels(arr, boxes[i]), axis=0)
+                d = np.abs(crop - bg).sum(axis=1)
+                if d.max() < 60:
+                    continue
+                ink = (d > 0.5 * d.max()).sum()
+                spx = size_ref * px_per_pt
+                dens.append(ink / (em_width(t, False) * spx * spx))
+            bold = bool(dens) and float(np.mean(dens)) > 0.235
+            base = {i: size_h for i in idxs}
+            for i in idxs:
+                bolds[i] = bold
+        else:
+            base = {i: lines[i]["size"] * scale * 72 for i in idxs}
+            for i in idxs:
+                bolds[i] = bool(lines[i]["flags"] & 16) or "bold" in lines[i]["font"].lower()
+
+        # fit to original width so text never spills into neighbouring boxes
+        fits = {}
+        for i in idxs:
+            x0, _, x1, _ = lines[i]["bbox"]
+            fits[i] = (x1 - x0) * scale * 72 / max(0.1, em_width(lines[i]["text"], bolds[i])) * 0.98
+        if from_ocr:
+            ref = min(float(np.median(list(fits.values()))), 1.45 * size_h)
+            ok = [f for f in fits.values() if f >= 0.7 * ref]
+            block_size = min([ref] + ok)
+            for i in idxs:
+                sizes[i] = min(block_size, fits[i])
+        else:
+            for i in idxs:
+                sizes[i] = min(base[i], fits[i])
+
+    for i in range(n):
+        sizes[i] = max(6.0, round(sizes[i] * 2) / 2)
+
+    # alignment per block (left or centre)
+    aligns = ["left"] * n
+    for idxs in blocks.values():
+        if len(idxs) < 2:
+            continue
+        lefts = [lines[i]["bbox"][0] for i in idxs]
+        cents = [(lines[i]["bbox"][0] + lines[i]["bbox"][2]) / 2 for i in idxs]
+        tol = 0.01 * max(l["bbox"][2] for l in lines)
+        if max(lefts) - min(lefts) > tol and max(cents) - min(cents) <= tol:
+            for i in idxs:
+                aligns[i] = "center"
+    return sizes, bolds, aligns
+
+
+def add_line(slide, ln, rect, scale, rgb, size_pt, bold, align, font_name):
     x0, y0, x1, y1 = ln["bbox"]
     left = (x0 - rect.x0) * scale
     top = (y0 - rect.y0) * scale
-    width = (x1 - x0) * scale * 1.10 + 0.05
+    width = (x1 - x0) * scale + 0.04
     height = (y1 - y0) * scale + 0.02
-    size_pdf = (y1 - y0) * OCR_FACTOR if from_ocr else ln["size"]
-    size_pt = max(6, min(120, size_pdf * scale * 72))
-
     box = slide.shapes.add_textbox(Inches(max(0, left)), Inches(max(0, top)),
                                    Inches(width), Inches(height))
     tf = box.text_frame
     tf.word_wrap = False
+    tf.auto_size = MSO_AUTO_SIZE.NONE
     tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
     p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.LEFT
+    p.alignment = PP_ALIGN.CENTER if align == "center" else PP_ALIGN.LEFT
     run = p.add_run()
     run.text = ln["text"]
     f = run.font
-    font_name = ln["font"].split("+")[-1].split(",")[0].split("-")[0] if ln["font"] and not from_ocr else ""
-    f.name = font_name or "Arial"
+    f.name = font_name
     f.size = Pt(size_pt)
-    f.bold = bool(ln["flags"] & 16) or "bold" in ln["font"].lower()
+    f.bold = bold
     f.italic = bool(ln["flags"] & 2)
     f.color.rgb = RGBColor(*rgb)
 
 
 # ---------------------------------------------------------------- converter
-def convert_pdf(pdf_bytes, editable, use_ocr, lang, dpi, progress=None):
+def convert_pdf(pdf_bytes, editable, use_ocr, lang, dpi, font_name="Arial", progress=None):
     report, problems = [], []
     k = dpi / 72.0
     with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
@@ -198,6 +301,7 @@ def convert_pdf(pdf_bytes, editable, use_ocr, lang, dpi, progress=None):
                 for l, b in zip(lines, boxes):
                     c = l["color"]
                     colors.append(estimate_fg(arr, b, ((c >> 16) & 255, (c >> 8) & 255, c & 255)))
+                sizes, bolds, aligns = layout_lines(lines, arr, boxes, scale, k, from_ocr)
                 arr = clean_background(arr, boxes)
             elif editable:
                 problems.append(i + 1)
@@ -207,8 +311,8 @@ def convert_pdf(pdf_bytes, editable, use_ocr, lang, dpi, progress=None):
             buf.seek(0)
             slide.shapes.add_picture(buf, 0, 0, Inches(slide_w), Inches(slide_h))
 
-            for l, rgb in zip(lines, colors):
-                add_line(slide, l, rect, scale, rgb, from_ocr)
+            for j, (l, rgb) in enumerate(zip(lines, colors)):
+                add_line(slide, l, rect, scale, rgb, sizes[j], bolds[j], aligns[j], font_name)
 
             report.append(f"Page {i + 1}: text boxes={len(lines)}; source={source}")
             if progress:
@@ -238,6 +342,8 @@ mode = st.radio("Conversion mode",
                 ["Editable slides (recommended)", "Image-only slides (exact look)"], index=0)
 use_ocr = st.checkbox("Use OCR for pages with no text", value=True)
 lang = st.text_input("OCR language code", value="eng", help="e.g. eng, eng+msa")
+font_name = st.selectbox("Slide font", ["Arial", "Calibri"], index=0,
+                         help="Arial matches the size calculation exactly; Calibri is narrower.")
 dpi = st.slider("Background image resolution (DPI)", 100, 300, 200, 25)
 include_report = st.checkbox("Include conversion report (.txt)", value=True)
 
@@ -250,7 +356,7 @@ if uploaded:
         try:
             bar = st.progress(0, text="Starting…")
             data, report, problems = convert_pdf(
-                pdf_bytes, mode.startswith("Editable"), use_ocr, lang, dpi,
+                pdf_bytes, mode.startswith("Editable"), use_ocr, lang, dpi, font_name,
                 progress=lambda v, t: bar.progress(v, text=t))
             st.session_state["pptx"] = data
             st.session_state["name"] = Path(uploaded.name).stem + "_editable.pptx"
